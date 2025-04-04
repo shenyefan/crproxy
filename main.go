@@ -21,14 +21,9 @@ var blockedSpiderUA = []string{"netcraft"}
 // routeByHosts 根据主机名选择对应的上游地址，返回 (上游地址, fakePage 标识)
 func routeByHosts(host string) (string, bool) {
 	routes := map[string]string{
-		"quay":       "quay.io",
-		"gcr":        "gcr.io",
-		"k8s-gcr":    "k8s.gcr.io",
-		"k8s":        "registry.k8s.io",
-		"ghcr":       "ghcr.io",
-		"cloudsmith": "docker.cloudsmith.io",
-		"nvcr":       "nvcr.io",
-		"hub":        "registry-1.docker.io",
+		"gcr":  "gcr.io",
+		"k8s":  "registry.k8s.io",
+		"ghcr": "ghcr.io",
 	}
 	if r, ok := routes[host]; ok {
 		return r, false

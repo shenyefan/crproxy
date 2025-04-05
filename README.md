@@ -4,7 +4,6 @@
 
 ## ✨ 功能特色
 
-- ✅ 支持 DockerHub 镜像搜索
 - ✅ 支持 DockerHub 镜像代理
 - ✅ 多仓库路由映射（如 `ghcr.io`, `gcr.io`, `quay.io` 等）
 - ✅ 支持重定向、支持跨域请求（CORS）

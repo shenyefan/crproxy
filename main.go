@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"log"
 	"net/http"
@@ -8,17 +9,19 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 )
 
-// 默认上游仓库地址和认证地址
-var hubHost = "registry-1.docker.io"
+var client = &http.Client{
+	Transport: &http.Transport{
+		MaxIdleConns:    100,
+		IdleConnTimeout: 90 * time.Second,
+	},
+}
 
 const authURL = "https://auth.docker.io"
 
-// 默认屏蔽爬虫 UA 列表
-var blockedSpiderUA = []string{"netcraft"}
-
-// routeByHosts 根据主机名选择对应的上游地址，返回 (上游地址, fakePage 标识)
+// routeByHosts 根据主机名选择对应的上游地址，返回上游地址
 func routeByHosts(host string) (string, bool) {
 	routes := map[string]string{
 		"gcr":  "gcr.io",
@@ -28,39 +31,10 @@ func routeByHosts(host string) (string, bool) {
 	if r, ok := routes[host]; ok {
 		return r, false
 	}
-	return hubHost, true
+	return "registry-1.docker.io", true
 }
 
-// nginx 返回一个伪装的 nginx 欢迎页面 HTML
-func nginx() string {
-	return `<!DOCTYPE html>
-	<html>
-	<head>
-	<title>Welcome to nginx!</title>
-	<style>
-		body {
-			width: 35em;
-			margin: 0 auto;
-			font-family: Tahoma, Verdana, Arial, sans-serif;
-		}
-	</style>
-	</head>
-	<body>
-	<h1>Welcome to nginx!</h1>
-	<p>If you see this page, the nginx web server is successfully installed and
-	working. Further configuration is required.</p>
-	
-	<p>For online documentation and support please refer to
-	<a href="http://nginx.org/">nginx.org</a>.<br/>
-	Commercial support is available at
-	<a href="http://nginx.com/">nginx.com</a>.</p>
-	
-	<p><em>Thank you for using nginx.</em></p>
-	</body>
-	</html>`
-}
-
-// searchInterface 返回 Docker Hub 镜像搜索页面 HTML（部分 HTML/CSS 代码可根据需要精简或完善）
+// searchInterface 返回 Docker Hub 镜像搜索页面 HTML
 func searchInterface() string {
 	return `<!DOCTYPE html>
 	<html>
@@ -236,24 +210,6 @@ func searchInterface() string {
 	</html>`
 }
 
-// add 将环境变量字符串中的空格、引号、换行符替换为逗号，并拆分为字符串切片
-func add(envadd string) []string {
-	replacer := strings.NewReplacer("\t", ",", " ", ",", "\"", ",", "'", ",", "\r", ",", "\n", ",")
-	addtext := replacer.Replace(envadd)
-	// 将多个逗号替换为一个
-	addtext = regexp.MustCompile(",+").ReplaceAllString(addtext, ",")
-	if strings.HasPrefix(addtext, ",") {
-		addtext = addtext[1:]
-	}
-	if strings.HasSuffix(addtext, ",") {
-		addtext = addtext[:len(addtext)-1]
-	}
-	if addtext == "" {
-		return []string{}
-	}
-	return strings.Split(addtext, ",")
-}
-
 // newUrl 构造一个新的 URL 对象，基于给定 base
 func newUrl(urlStr, base string) *url.URL {
 	baseURL, err := url.Parse(base)
@@ -299,7 +255,7 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 	io.Copy(w, resp.Body)
 }
 
-// processResponseHeaders 修改响应中 Www-Authenticate 头（将认证地址替换为 workers_url）
+// processResponseHeaders 修改响应中 Www-Authenticate 头（将认证地址替换为 workersUrl）
 func processResponseHeaders(resp *http.Response, workersUrl string) {
 	if wwwAuth := resp.Header.Get("Www-Authenticate"); wwwAuth != "" {
 		newAuth := strings.ReplaceAll(wwwAuth, authURL, workersUrl)
@@ -309,7 +265,7 @@ func processResponseHeaders(resp *http.Response, workersUrl string) {
 
 // proxy 发起代理请求并对响应做一些头部调整
 func proxy(w http.ResponseWriter, req *http.Request, rawLen string) {
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -337,8 +293,39 @@ func proxy(w http.ResponseWriter, req *http.Request, rawLen string) {
 	copyResponse(w, resp)
 }
 
-// httpHandler 用于处理重定向和 OPTIONS（预检）请求
-func httpHandler(w http.ResponseWriter, r *http.Request, pathname, baseHost string) {
+// fixURL 对 URL 进行编码修正
+func fixURL(u *url.URL) *url.URL {
+	if !strings.Contains(u.RawQuery, "%2F") && strings.Contains(u.String(), "%3A") {
+		modifiedUrlStr := strings.Replace(u.String(), "%3A", "%3Alibrary%2F", 1)
+		newURL, err := url.Parse(modifiedUrlStr)
+		if err == nil {
+			return newURL
+		}
+	}
+	return u
+}
+
+// cloneBody 返回一个新的 io.ReadCloser，用于复制请求体
+func cloneBody(body []byte) io.ReadCloser {
+	if len(body) == 0 {
+		return nil
+	}
+	return io.NopCloser(bytes.NewReader(body))
+}
+
+// adjustAcceptHeader 确保 Accept 头包含对 OCI index 的支持
+func adjustAcceptHeader(header http.Header) {
+	accept := header.Get("Accept")
+	if accept == "" {
+		accept = "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json"
+	} else if !strings.Contains(accept, "application/vnd.oci.image.index.v1+json") {
+		accept = accept + ", application/vnd.oci.image.index.v1+json"
+	}
+	header.Set("Accept", accept)
+}
+
+// httpHandler 用于处理重定向和 OPTIONS（预检）请求，新增 body 参数以支持重放请求体
+func httpHandler(w http.ResponseWriter, r *http.Request, pathname, baseHost string, body []byte) {
 	// 处理预检请求
 	if r.Method == "OPTIONS" && r.Header.Get("access-control-request-headers") != "" {
 		w.Header().Set("access-control-allow-origin", "*")
@@ -348,16 +335,16 @@ func httpHandler(w http.ResponseWriter, r *http.Request, pathname, baseHost stri
 		return
 	}
 
-	// 复制请求头并删除 Authorization 以修复 s3 问题
 	newHeaders := r.Header.Clone()
 	newHeaders.Del("Authorization")
+	adjustAcceptHeader(newHeaders)
 
 	urlObj := newUrl(pathname, "https://"+baseHost)
 	if urlObj == nil {
 		http.Error(w, "Invalid URL", http.StatusBadRequest)
 		return
 	}
-	proxyReq, err := http.NewRequest(r.Method, urlObj.String(), r.Body)
+	proxyReq, err := http.NewRequest(r.Method, urlObj.String(), cloneBody(body))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -366,12 +353,16 @@ func httpHandler(w http.ResponseWriter, r *http.Request, pathname, baseHost stri
 	proxy(w, proxyReq, "")
 }
 
-// mainHandler 为入口处理函数，依据请求参数、User-Agent 以及环境变量决定转发或返回伪装页面
 func mainHandler(w http.ResponseWriter, r *http.Request) {
-	// 如果环境变量 UA 存在，则将额外的 UA 添加到屏蔽列表中
-	if envUA := os.Getenv("UA"); envUA != "" {
-		extra := add(envUA)
-		blockedSpiderUA = append(blockedSpiderUA, extra...)
+	// 读取并缓存请求体，便于重用
+	var bodyBytes []byte
+	if r.Body != nil {
+		var err error
+		bodyBytes, err = io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	workersUrl := "https://" + r.Host
@@ -383,65 +374,52 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	hostParts := strings.Split(hostname, ".")
 	hostTop := hostParts[0]
+
+	var localHubHost string
 	fakePage := false
 	if ns != "" {
 		if ns == "docker.io" {
-			hubHost = "registry-1.docker.io"
+			localHubHost = "registry-1.docker.io"
 		} else {
-			hubHost = ns
+			localHubHost = ns
 		}
 	} else {
 		var rp bool
-		hubHost, rp = routeByHosts(hostTop)
+		localHubHost, rp = routeByHosts(hostTop)
 		fakePage = rp
 	}
 
-	log.Printf("域名头部: %s 反代地址: %s searchInterface: %v", hostTop, hubHost, fakePage)
+	log.Printf("域名头部: %s 反代地址: %s searchInterface: %v", hostTop, localHubHost, fakePage)
 
 	// 修改请求 URL 的 scheme 与 host
 	r.URL.Scheme = "https"
-	r.URL.Host = hubHost
+	r.URL.Host = localHubHost
 
 	hubParams := []string{"/v1/search", "/v1/repositories"}
 	userAgent := strings.ToLower(r.Header.Get("User-Agent"))
 
-	// 屏蔽特定 UA 的爬虫
-	for _, blocked := range blockedSpiderUA {
-		if strings.Contains(userAgent, strings.ToLower(blocked)) {
-			w.Header().Set("Content-Type", "text/html; charset=UTF-8")
-			io.WriteString(w, nginx())
-			return
-		}
-	}
-
-	// 若 User-Agent 包含 mozilla 或请求 URL 中包含特定参数则走页面或转发逻辑
+	// 针对包含 mozilla 或指定路径的请求走页面/转发逻辑
 	if strings.Contains(userAgent, "mozilla") || anyContains(r.URL.Path, hubParams) {
 		if r.URL.Path == "/" {
 			if url302 := os.Getenv("URL302"); url302 != "" {
 				http.Redirect(w, r, url302, http.StatusFound)
 				return
 			} else if urlEnv := os.Getenv("URL"); urlEnv != "" {
-				if strings.ToLower(urlEnv) == "nginx" {
-					w.Header().Set("Content-Type", "text/html; charset=UTF-8")
-					io.WriteString(w, nginx())
-					return
-				} else {
-					// 将请求代理到环境变量 URL 指定的地址
-					proxyReq, err := http.NewRequest(r.Method, urlEnv, r.Body)
-					if err != nil {
-						http.Error(w, err.Error(), http.StatusInternalServerError)
-						return
-					}
-					copyHeader(proxyReq.Header, r.Header)
-					resp, err := http.DefaultClient.Do(proxyReq)
-					if err != nil {
-						http.Error(w, err.Error(), http.StatusBadGateway)
-						return
-					}
-					defer resp.Body.Close()
-					copyResponse(w, resp)
+				proxyReq, err := http.NewRequest(r.Method, urlEnv, cloneBody(bodyBytes))
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
+				copyHeader(proxyReq.Header, r.Header)
+				adjustAcceptHeader(proxyReq.Header)
+				resp, err := client.Do(proxyReq)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadGateway)
+					return
+				}
+				defer resp.Body.Close()
+				copyResponse(w, resp)
+				return
 			} else {
 				if fakePage {
 					w.Header().Set("Content-Type", "text/html; charset=UTF-8")
@@ -451,7 +429,7 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			if fakePage {
-				// 当处于 fakePage 模式时，将 host 改为 hub.docker.com
+				// fakePage 模式下，将 host 改为 hub.docker.com
 				r.URL.Host = "hub.docker.com"
 			}
 			// 若查询参数 q 中包含 "library/" 但不等于 "library/" 则去除之
@@ -460,13 +438,14 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 				query.Set("q", q)
 				r.URL.RawQuery = query.Encode()
 			}
-			newReq, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
+			newReq, err := http.NewRequest(r.Method, r.URL.String(), cloneBody(bodyBytes))
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 			copyHeader(newReq.Header, r.Header)
-			resp, err := http.DefaultClient.Do(newReq)
+			adjustAcceptHeader(newReq.Header)
+			resp, err := client.Do(newReq)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadGateway)
 				return
@@ -474,7 +453,7 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 			defer resp.Body.Close()
 			processResponseHeaders(resp, workersUrl)
 			if loc := resp.Header.Get("Location"); loc != "" {
-				httpHandler(w, r, loc, hubHost)
+				httpHandler(w, r, loc, localHubHost, bodyBytes)
 				return
 			}
 			copyResponse(w, resp)
@@ -482,29 +461,23 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 修改 URL 中的编码问题（%3A 替换为 %3Alibrary%2F）
-	if !strings.Contains(r.URL.RawQuery, "%2F") && strings.Contains(r.URL.String(), "%3A") {
-		modifiedUrlStr := strings.Replace(r.URL.String(), "%3A", "%3Alibrary%2F", 1)
-		u, err := url.Parse(modifiedUrlStr)
-		if err == nil {
-			r.URL = u
-		}
-		log.Printf("handle_url: %s", r.URL.String())
-	}
+	// 修正 URL 编码问题
+	r.URL = fixURL(r.URL)
 
 	// 处理 token 请求
 	if strings.Contains(r.URL.Path, "/token") {
 		tokenURL := authURL + r.URL.Path + "?" + r.URL.RawQuery
-		tokenReq, err := http.NewRequest(r.Method, tokenURL, r.Body)
+		tokenReq, err := http.NewRequest(r.Method, tokenURL, cloneBody(bodyBytes))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		tokenReq.Header.Set("Host", "auth.docker.io")
 		copyHeader(tokenReq.Header, r.Header)
+		adjustAcceptHeader(tokenReq.Header)
 		tokenReq.Header.Set("Connection", "keep-alive")
 		tokenReq.Header.Set("Cache-Control", "max-age=0")
-		resp, err := http.DefaultClient.Do(tokenReq)
+		resp, err := client.Do(tokenReq)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -514,8 +487,8 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 当 hubHost 为 registry-1.docker.io 且请求符合特定正则时，修改路径前缀
-	if hubHost == "registry-1.docker.io" {
+	// 针对 registry-1.docker.io 特定请求修改路径前缀
+	if localHubHost == "registry-1.docker.io" {
 		matched, _ := regexp.MatchString(`^/v2/[^/]+/[^/]+/[^/]+$`, r.URL.Path)
 		if matched && !strings.HasPrefix(r.URL.Path, "/v2/library") {
 			parts := strings.SplitN(r.URL.Path, "/v2/", 2)
@@ -526,15 +499,23 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 构造新的请求并设置必要的 header
-	newReq, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
+	newReq, err := http.NewRequest(r.Method, r.URL.String(), cloneBody(bodyBytes))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	newReq.Header.Set("Host", hubHost)
+	newReq.Header.Set("Host", localHubHost)
 	newReq.Header.Set("User-Agent", r.Header.Get("User-Agent"))
-	newReq.Header.Set("Accept", r.Header.Get("Accept"))
+	// 处理 Accept 头，确保 OCI index 类型被包含
+	{
+		accept := r.Header.Get("Accept")
+		if accept == "" {
+			accept = "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json"
+		} else if !strings.Contains(accept, "application/vnd.oci.image.index.v1+json") {
+			accept = accept + ", application/vnd.oci.image.index.v1+json"
+		}
+		newReq.Header.Set("Accept", accept)
+	}
 	newReq.Header.Set("Accept-Language", r.Header.Get("Accept-Language"))
 	newReq.Header.Set("Accept-Encoding", r.Header.Get("Accept-Encoding"))
 	newReq.Header.Set("Connection", "keep-alive")
@@ -546,7 +527,7 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 		newReq.Header.Set("X-Amz-Content-Sha256", xAmz)
 	}
 
-	resp, err := http.DefaultClient.Do(newReq)
+	resp, err := client.Do(newReq)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -554,7 +535,7 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	processResponseHeaders(resp, workersUrl)
 	if loc := resp.Header.Get("Location"); loc != "" {
-		httpHandler(w, r, loc, hubHost)
+		httpHandler(w, r, loc, localHubHost, bodyBytes)
 		return
 	}
 	copyResponse(w, resp)
